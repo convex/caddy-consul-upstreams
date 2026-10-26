@@ -96,7 +96,7 @@ jobs:
       - name: Install xcaddy
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@${{ env.XCADDY_VERSION }}
       - name: Build Caddy with this module
-        run: xcaddy build ${{ env.CADDY_VERSION }} --with github.com/get-convex/caddy-consul-upstreams=.
+        run: xcaddy build ${{ env.CADDY_VERSION }} --with github.com/convex/caddy-consul-upstreams=.
       - name: Module is registered
         run: ./caddy list-modules | grep -Fx http.reverse_proxy.upstreams.consul
       - name: Caddyfile adapts

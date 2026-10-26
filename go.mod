@@ -1,4 +1,4 @@
-module github.com/get-convex/caddy-consul-upstreams
+module github.com/convex/caddy-consul-upstreams
 
 go 1.26
 
