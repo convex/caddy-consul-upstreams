@@ -242,7 +242,8 @@ func (u *ConsulUpstreams) ResetCache(r *http.Request) error {
 }
 
 func (u *ConsulUpstreams) makeSnapshot(entries []*api.ServiceEntry) snapshot {
-	seen := make(map[string]struct{}, len(entries))
+	type locality struct{ local, nonlocal bool }
+	seen := make(map[string]*locality, len(entries))
 	var result snapshot
 	for _, entry := range entries {
 		if entry == nil || entry.Node == nil || entry.Service == nil || entry.Service.Port < 1 || entry.Service.Port > 65535 {
@@ -256,14 +257,30 @@ func (u *ConsulUpstreams) makeSnapshot(entries []*api.ServiceEntry) snapshot {
 			continue
 		}
 		dial := net.JoinHostPort(host, strconv.Itoa(entry.Service.Port))
-		if _, ok := seen[dial]; ok {
-			continue
+		location, ok := seen[dial]
+		if !ok {
+			location = new(locality)
+			seen[dial] = location
+			result.all = append(result.all, dial)
 		}
-		seen[dial] = struct{}{}
-		result.all = append(result.all, dial)
 		if u.Locality != nil && entry.Node.Meta[u.Locality.NodeMetaKey] == u.Locality.LocalValue {
-			result.local = append(result.local, dial)
+			location.local = true
+		} else {
+			location.nonlocal = true
 		}
+	}
+	var conflicting []string
+	for _, dial := range result.all {
+		location := seen[dial]
+		if location.local {
+			result.local = append(result.local, dial)
+			if location.nonlocal {
+				conflicting = append(conflicting, dial)
+			}
+		}
+	}
+	if len(conflicting) > 0 && u.logger != nil {
+		u.logger.Debug("Consul registrations have conflicting locality metadata", zap.Strings("upstreams", conflicting))
 	}
 	return result
 }
