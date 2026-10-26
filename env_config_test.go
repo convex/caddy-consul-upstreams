@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"strings"
 	"sync"
 	"testing"
 
@@ -67,6 +69,52 @@ func TestProvisionValidatesExpandedLocality(t *testing.T) {
 			}
 			if f.callCount() != 0 {
 				t.Fatal("invalid configuration queried Consul")
+			}
+		})
+	}
+}
+
+func TestProvisionRejectsExplicitEmptyAddressExpansion(t *testing.T) {
+	t.Setenv("TEST_UNSET_CONSUL_ADDR", "")
+	if err := os.Unsetenv("TEST_UNSET_CONSUL_ADDR"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_EMPTY_CONSUL_ADDR", "")
+	t.Setenv("TEST_WHITESPACE_CONSUL_ADDR", " \t")
+	for _, address := range []string{
+		"{env.TEST_UNSET_CONSUL_ADDR}",
+		"{env.TEST_EMPTY_CONSUL_ADDR}",
+		"{env.TEST_WHITESPACE_CONSUL_ADDR}",
+		" {env.TEST_EMPTY_CONSUL_ADDR} ",
+		" \t",
+	} {
+		t.Run(address, func(t *testing.T) {
+			f := &fakeConsul{}
+			u := &ConsulUpstreams{Service: "api", Address: address, client: f}
+			err := u.Provision(caddy.Context{Context: context.Background()})
+			if err == nil || !strings.Contains(err.Error(), "address expanded to an empty value") {
+				t.Fatalf("expected an empty address expansion error, got %v", err)
+			}
+			if f.callCount() != 0 {
+				t.Fatal("invalid address queried Consul")
+			}
+		})
+	}
+}
+
+func TestProvisionDefaultsOmittedOrEmptyAddress(t *testing.T) {
+	for _, config := range []string{`{"service":"api"}`, `{"service":"api","address":""}`} {
+		t.Run(config, func(t *testing.T) {
+			var u ConsulUpstreams
+			if err := json.Unmarshal([]byte(config), &u); err != nil {
+				t.Fatal(err)
+			}
+			u.client = &fakeConsul{}
+			if err := u.Provision(caddy.Context{Context: context.Background()}); err != nil {
+				t.Fatal(err)
+			}
+			if u.Address != "http://127.0.0.1:8500" {
+				t.Fatalf("default address = %q", u.Address)
 			}
 		})
 	}
