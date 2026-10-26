@@ -25,6 +25,7 @@ const (
 	moduleID        = "http.reverse_proxy.upstreams.consul"
 	tierPlaceholder = "http.reverse_proxy.upstreams.consul.tier"
 	consulTimeout   = 5 * time.Second
+	retryVar        = "consul_upstreams_selection"
 )
 
 // ConsulUpstreams discovers passing service instances through Consul.
@@ -46,6 +47,7 @@ type Locality struct {
 	NodeMetaKey string `json:"node_meta,omitempty"`
 	LocalValue  string `json:"local_value,omitempty"`
 	Minimum     int    `json:"minimum,omitempty"`
+	Strict      bool   `json:"strict,omitempty"`
 }
 
 type consulClient interface {
@@ -164,7 +166,7 @@ func (u *ConsulUpstreams) GetUpstreams(r *http.Request) ([]*reverseproxy.Upstrea
 		}
 	}
 
-	tier, dials := u.selectTier(entry.snapshot)
+	tier, dials := u.selectForRequest(r, service, entry.snapshot)
 	setTier(r, tier)
 	return upstreams(dials), nil
 }
@@ -211,14 +213,54 @@ func (entry cacheEntry) isFresh(refresh caddy.Duration) bool {
 	return time.Since(entry.freshness) < time.Duration(refresh)
 }
 
-func (u *ConsulUpstreams) selectTier(snapshot snapshot) (string, []string) {
+func (u *ConsulUpstreams) selectTier(snapshot snapshot, retried bool) (string, []string) {
 	if u.Locality == nil {
 		return "all", snapshot.all
 	}
 	if len(snapshot.local) >= u.Locality.Minimum {
+		if retried && !u.Locality.Strict {
+			return "fallback", snapshot.all
+		}
 		return "local", snapshot.local
 	}
 	return "all", snapshot.all
+}
+
+// requestSelection is scoped to a source instance and service so retry state
+// cannot affect another reverse_proxy handler sharing the request's variables.
+type requestSelection struct {
+	tier    string
+	retried bool
+}
+
+func (u *ConsulUpstreams) selectionKey(service string) string {
+	return fmt.Sprintf("%s.%p.%s", retryVar, u, service)
+}
+
+func (u *ConsulUpstreams) selectForRequest(r *http.Request, service string, snapshot snapshot) (string, []string) {
+	var state requestSelection
+	if r != nil {
+		state, _ = caddyhttp.GetVar(r.Context(), u.selectionKey(service)).(requestSelection)
+	}
+	tier, dials := u.selectTier(snapshot, state.retried && (state.tier == "local" || state.tier == "fallback"))
+	// A retry must not narrow an already-global pool if Consul's refreshed
+	// snapshot happens to have enough local registrations this time.
+	if state.retried && state.tier == "all" {
+		tier, dials = "all", snapshot.all
+	}
+	if r != nil {
+		state.tier = tier
+		caddyhttp.SetVar(r.Context(), u.selectionKey(service), state)
+	}
+	return tier, dials
+}
+
+func (u *ConsulUpstreams) markRetry(r *http.Request, service string) {
+	state, _ := caddyhttp.GetVar(r.Context(), u.selectionKey(service)).(requestSelection)
+	if state.tier != "" {
+		state.retried = true
+		caddyhttp.SetVar(r.Context(), u.selectionKey(service), state)
+	}
 }
 
 func (u *ConsulUpstreams) ResetCache(r *http.Request) error {
@@ -232,6 +274,7 @@ func (u *ConsulUpstreams) ResetCache(r *http.Request) error {
 	if !validServiceName(service) {
 		return nil
 	}
+	u.markRetry(r, service)
 	u.mu.Lock()
 	if entry, ok := u.entries[service]; ok {
 		entry.freshness = time.Time{}
@@ -371,6 +414,11 @@ func (u *ConsulUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			u.Locality = &Locality{}
 			for nesting := d.Nesting(); d.NextBlock(nesting); {
 				switch d.Val() {
+				case "strict":
+					if d.NextArg() {
+						return d.ArgErr()
+					}
+					u.Locality.Strict = true
 				case "node_meta":
 					if !d.NextArg() {
 						return d.ArgErr()

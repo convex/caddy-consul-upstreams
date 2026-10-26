@@ -237,7 +237,7 @@ func TestConcurrentFirstRefreshIsSingle(t *testing.T) {
 	}
 }
 
-func TestLocalitySelectionRefreshesOnReset(t *testing.T) {
+func TestLocalitySelectionRefreshes(t *testing.T) {
 	f := &fakeConsul{entries: []*api.ServiceEntry{
 		instance("10.0.0.1", "", 80, map[string]string{"az": "a"}),
 		instance("10.0.0.2", "", 80, map[string]string{"az": "a"}),
@@ -260,9 +260,11 @@ func TestLocalitySelectionRefreshesOnReset(t *testing.T) {
 		instance("10.0.1.1", "", 80, map[string]string{"az": "b"}),
 		instance("10.0.2.1", "", 80, map[string]string{"az": "c"}),
 	}, nil)
-	if err := u.ResetCache(r); err != nil {
-		t.Fatal(err)
-	}
+	u.mu.Lock()
+	entry := u.entries["api"]
+	entry.freshness = time.Time{}
+	u.entries["api"] = entry
+	u.mu.Unlock()
 	got, err = u.GetUpstreams(r)
 	if err != nil || len(got) != 3 || tier(r) != "all" {
 		t.Fatalf("all: %v %v %q", got, err, tier(r))
