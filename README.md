@@ -48,6 +48,10 @@ and cannot be `.` or `..`. Invalid expanded names are rejected before any
 Consul request. This validates syntax only; it does not authorize which
 services a request-controlled placeholder can select.
 
+In JSON configurations, `{env.*}` placeholders are expanded in `address`,
+`locality.node_meta`, and `locality.local_value` when the module is provisioned.
+The `service` value is expanded per request.
+
 ## JSON
 
 ```json

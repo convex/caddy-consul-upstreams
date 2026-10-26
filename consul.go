@@ -73,6 +73,16 @@ func (*ConsulUpstreams) CaddyModule() caddy.ModuleInfo {
 }
 
 func (u *ConsulUpstreams) Provision(ctx caddy.Context) error {
+	repl := caddy.NewReplacer()
+	address := repl.ReplaceAll(u.Address, "")
+	if u.Address != "" && strings.TrimSpace(address) == "" {
+		return errors.New("Consul address expanded to an empty value")
+	}
+	u.Address = address
+	if u.Locality != nil {
+		u.Locality.NodeMetaKey = repl.ReplaceAll(u.Locality.NodeMetaKey, "")
+		u.Locality.LocalValue = repl.ReplaceAll(u.Locality.LocalValue, "")
+	}
 	if err := u.Validate(); err != nil {
 		return err
 	}
