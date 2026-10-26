@@ -73,6 +73,12 @@ func (*ConsulUpstreams) CaddyModule() caddy.ModuleInfo {
 }
 
 func (u *ConsulUpstreams) Provision(ctx caddy.Context) error {
+	repl := caddy.NewReplacer()
+	u.Address = repl.ReplaceAll(u.Address, "")
+	if u.Locality != nil {
+		u.Locality.NodeMetaKey = repl.ReplaceAll(u.Locality.NodeMetaKey, "")
+		u.Locality.LocalValue = repl.ReplaceAll(u.Locality.LocalValue, "")
+	}
 	if err := u.Validate(); err != nil {
 		return err
 	}
