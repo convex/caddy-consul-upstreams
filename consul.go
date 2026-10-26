@@ -22,10 +22,13 @@ import (
 )
 
 const (
-	moduleID        = "http.reverse_proxy.upstreams.consul"
-	tierPlaceholder = "http.reverse_proxy.upstreams.consul.tier"
-	consulTimeout   = 5 * time.Second
-	retryVar        = "consul_upstreams_selection"
+	moduleID         = "http.reverse_proxy.upstreams.consul"
+	tierPlaceholder  = "http.reverse_proxy.upstreams.consul.tier"
+	consulTimeout    = 5 * time.Second
+	cacheLimit       = 100
+	fillLimit        = 8
+	resetMinInterval = time.Second
+	retryVar         = "consul_upstreams_selection"
 )
 
 // ConsulUpstreams discovers passing service instances through Consul.
@@ -34,12 +37,19 @@ type ConsulUpstreams struct {
 	Service     string         `json:"service,omitempty"`
 	Refresh     caddy.Duration `json:"refresh,omitempty"`
 	GracePeriod caddy.Duration `json:"grace_period,omitempty"`
+	Timeout     caddy.Duration `json:"timeout,omitempty"`
 	Locality    *Locality      `json:"locality,omitempty"`
 
-	client  consulClient
-	logger  *zap.Logger
-	mu      sync.RWMutex
-	entries map[string]cacheEntry
+	client    consulClient
+	logger    *zap.Logger
+	ctx       context.Context
+	cancel    context.CancelFunc
+	closeIdle func()
+	mu        sync.Mutex
+	entries   map[string]*cacheEntry
+	fills     chan struct{}
+	wg        sync.WaitGroup
+	closed    bool
 }
 
 // Locality controls local-node preference.
@@ -61,9 +71,25 @@ func (a apiClient) Service(ctx context.Context, service string) ([]*api.ServiceE
 	return entries, err
 }
 
+// cacheEntry fields are guarded by mu. Snapshots are immutable after creation.
 type cacheEntry struct {
-	snapshot  snapshot
-	freshness time.Time
+	snapshot    snapshot
+	hasResult   bool
+	freshness   time.Time
+	lastSuccess time.Time
+	lastUsed    time.Time
+	nextTry     time.Time
+	failures    int
+	err         error
+	inflight    *cacheFill
+	discard     bool
+}
+
+// A waiter reads its own completed fill, even if a later fill has already started.
+type cacheFill struct {
+	done     chan struct{}
+	snapshot snapshot
+	err      error
 }
 
 type snapshot struct{ all, local []string }
@@ -89,18 +115,31 @@ func (u *ConsulUpstreams) Provision(ctx caddy.Context) error {
 		return err
 	}
 	u.logger = ctx.Logger()
-	u.entries = make(map[string]cacheEntry)
+	u.initCache(ctx.Context)
 	if u.client == nil {
-		client, err := newConsulClient(u.Address, consulTimeout)
+		client, closeIdle, err := newConsulClientWithCleanup(u.Address, time.Duration(u.Timeout))
 		if err != nil {
+			u.cancel()
 			return fmt.Errorf("creating Consul client: %w", err)
 		}
 		u.client = apiClient{client}
+		u.closeIdle = closeIdle
 	}
 	return nil
 }
 
+func (u *ConsulUpstreams) initCache(ctx context.Context) {
+	u.ctx, u.cancel = context.WithCancel(ctx)
+	u.entries = make(map[string]*cacheEntry)
+	u.fills = make(chan struct{}, fillLimit)
+}
+
 func newConsulClient(address string, timeout time.Duration) (*api.Client, error) {
+	client, _, err := newConsulClientWithCleanup(address, timeout)
+	return client, err
+}
+
+func newConsulClientWithCleanup(address string, timeout time.Duration) (*api.Client, func(), error) {
 	config := api.DefaultConfig()
 	config.Address = address
 	if strings.HasPrefix(address, "http://") {
@@ -110,10 +149,10 @@ func newConsulClient(address string, timeout time.Duration) (*api.Client, error)
 	}
 	client, err := api.NewClient(config)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	config.HttpClient.Timeout = timeout
-	return client, nil
+	return client, config.HttpClient.CloseIdleConnections, nil
 }
 
 func (u *ConsulUpstreams) Validate() error {
@@ -122,6 +161,12 @@ func (u *ConsulUpstreams) Validate() error {
 	}
 	if u.Refresh == 0 {
 		u.Refresh = caddy.Duration(time.Minute)
+	}
+	if u.Timeout == 0 {
+		u.Timeout = caddy.Duration(consulTimeout)
+	}
+	if u.Timeout < 0 {
+		return errors.New("timeout must be positive")
 	}
 	if strings.TrimSpace(u.Service) == "" {
 		return errors.New("service is required")
@@ -155,62 +200,203 @@ func (u *ConsulUpstreams) GetUpstreams(r *http.Request) ([]*reverseproxy.Upstrea
 		return nil, fmt.Errorf("invalid Consul service name %q", service)
 	}
 
-	u.mu.RLock()
-	entry, ok := u.entries[service]
-	u.mu.RUnlock()
-	if !ok || !entry.isFresh(u.Refresh) {
-		var err error
-		entry, err = u.refresh(r.Context(), service)
-		if err != nil {
-			return nil, err
-		}
+	ctx := context.Background()
+	if r != nil {
+		ctx = r.Context()
 	}
-
-	tier, dials := u.selectForRequest(r, service, entry.snapshot)
+	snapshot, err := u.getSnapshot(ctx, service)
+	if err != nil {
+		return nil, err
+	}
+	tier, dials := u.selectForRequest(r, service, snapshot)
 	setTier(r, tier)
 	return upstreams(dials), nil
 }
 
-func (u *ConsulUpstreams) refresh(ctx context.Context, service string) (cacheEntry, error) {
+func (u *ConsulUpstreams) getSnapshot(ctx context.Context, service string) (snapshot, error) {
+	if err := ctx.Err(); err != nil {
+		return snapshot{}, err
+	}
 	u.mu.Lock()
-	defer u.mu.Unlock()
-
+	if u.closed {
+		u.mu.Unlock()
+		return snapshot{}, context.Canceled
+	}
+	if err := u.ctx.Err(); err != nil {
+		u.mu.Unlock()
+		return snapshot{}, err
+	}
 	entry, ok := u.entries[service]
-	if ok && entry.isFresh(u.Refresh) {
-		return entry, nil
-	}
-	entries, err := u.client.Service(ctx, service)
-	if err != nil {
-		if ok && u.GracePeriod > 0 {
-			if u.logger != nil {
-				u.logger.Warn("Consul upstream refresh failed; using cached snapshot", zap.String("service", service), zap.Error(err))
-			}
-			entry.freshness = time.Now().Add(time.Duration(u.GracePeriod) - time.Duration(u.Refresh))
-			u.entries[service] = entry
-			return entry, nil
+	if !ok {
+		if len(u.entries) >= cacheLimit && !u.evictLocked() {
+			u.mu.Unlock()
+			return snapshot{}, errors.New("Consul upstream cache is full with active refreshes")
 		}
-		return cacheEntry{}, fmt.Errorf("refreshing Consul service %q: %w", service, err)
+		entry = new(cacheEntry)
+		u.entries[service] = entry
 	}
+	now := time.Now()
+	entry.lastUsed = now
+	if entry.isFresh(u.Refresh) {
+		result := entry.snapshot
+		u.mu.Unlock()
+		return result, nil
+	}
+	if entry.hasResult && u.GracePeriod > 0 {
+		if entry.inflight == nil && !now.Before(entry.nextTry) {
+			u.startFillLocked(service, entry)
+		}
+		result := entry.snapshot
+		u.mu.Unlock()
+		return result, nil
+	}
+	if entry.inflight == nil && now.Before(entry.nextTry) {
+		err := entry.err
+		u.mu.Unlock()
+		return snapshot{}, err
+	}
+	if entry.inflight == nil {
+		u.startFillLocked(service, entry)
+	}
+	fill := entry.inflight
+	u.mu.Unlock()
 
-	if !ok && len(u.entries) >= 100 {
-		var evicted string
-		for key := range u.entries {
-			if evicted == "" || key < evicted {
-				evicted = key
-			}
-		}
-		delete(u.entries, evicted)
+	select {
+	case <-ctx.Done():
+		return snapshot{}, ctx.Err()
+	case <-u.ctx.Done():
+		return snapshot{}, u.ctx.Err()
+	case <-fill.done:
+		return fill.snapshot, fill.err
 	}
-	entry = cacheEntry{
-		snapshot:  u.makeSnapshot(entries),
-		freshness: time.Now(),
-	}
-	u.entries[service] = entry
-	return entry, nil
 }
 
-func (entry cacheEntry) isFresh(refresh caddy.Duration) bool {
-	return time.Since(entry.freshness) < time.Duration(refresh)
+// evictLocked keeps active fills in the cache so a new request cannot start a
+// duplicate fill for the same service. If all entries are active, reject a new
+// service rather than letting untrusted service names grow the cache or queue.
+func (u *ConsulUpstreams) evictLocked() bool {
+	var oldest string
+	var oldestTime time.Time
+	for key, entry := range u.entries {
+		if entry.inflight == nil && (oldest == "" || entry.lastUsed.Before(oldestTime)) {
+			oldest, oldestTime = key, entry.lastUsed
+		}
+	}
+	if oldest == "" {
+		return false
+	}
+	delete(u.entries, oldest)
+	return true
+}
+
+// startFillLocked registers work before releasing mu, which also serializes
+// WaitGroup.Add with Cleanup's transition to the closed state.
+func (u *ConsulUpstreams) startFillLocked(service string, entry *cacheEntry) {
+	fill := &cacheFill{done: make(chan struct{})}
+	entry.inflight = fill
+	u.wg.Add(1)
+	go u.refresh(service, entry, fill)
+}
+
+func (u *ConsulUpstreams) refresh(service string, entry *cacheEntry, fill *cacheFill) {
+	defer u.wg.Done()
+	var result snapshot
+	var err error
+	start := time.Now()
+	select {
+	case u.fills <- struct{}{}:
+		defer func() { <-u.fills }()
+		if u.logger != nil {
+			u.logger.Debug("refreshing Consul upstreams", zap.String("service", service))
+		}
+		ctx, cancel := context.WithTimeout(u.ctx, time.Duration(u.Timeout))
+		entries, queryErr := u.client.Service(ctx, service)
+		cancel()
+		err = queryErr
+		if err == nil {
+			result = u.makeSnapshot(entries)
+		}
+	case <-u.ctx.Done():
+		err = u.ctx.Err()
+	}
+
+	u.mu.Lock()
+	now := time.Now()
+	if err == nil {
+		entry.snapshot, entry.hasResult = result, true
+		entry.freshness, entry.lastSuccess = now, now
+		entry.nextTry, entry.failures, entry.err = time.Time{}, 0, nil
+		fill.snapshot = result
+	} else {
+		entry.err = fmt.Errorf("refreshing Consul service %q: %w", service, err)
+		entry.failures++
+		if entry.hasResult && u.GracePeriod > 0 {
+			entry.freshness = now.Add(time.Duration(u.GracePeriod) - time.Duration(u.Refresh))
+			entry.nextTry = now.Add(time.Duration(u.GracePeriod))
+		} else {
+			entry.nextTry = now.Add(u.failureBackoff(entry.failures))
+		}
+		fill.err = entry.err
+	}
+	servedStale := entry.hasResult && u.GracePeriod > 0
+	entry.inflight = nil
+	if entry.discard {
+		delete(u.entries, service)
+	}
+	close(fill.done)
+	u.mu.Unlock()
+
+	if u.logger != nil {
+		if err == nil {
+			u.logger.Debug("refreshed Consul upstreams", zap.String("service", service), zap.Int("instances", len(result.all)), zap.Int("local", len(result.local)), zap.Duration("duration", time.Since(start)))
+		} else {
+			message := "Consul upstream refresh failed"
+			if servedStale {
+				message += "; serving cached snapshot"
+			}
+			u.logger.Warn(message, zap.String("service", service), zap.Error(err))
+		}
+	}
+}
+
+func (u *ConsulUpstreams) failureBackoff(failures int) time.Duration {
+	limit := min(time.Duration(u.Refresh), 30*time.Second)
+	backoff := min(time.Second, limit)
+	for failure := 1; failure < failures && backoff < limit; failure++ {
+		backoff = min(2*backoff, limit)
+	}
+	return backoff
+}
+
+func (entry *cacheEntry) isFresh(refresh caddy.Duration) bool {
+	return entry.hasResult && time.Since(entry.freshness) < time.Duration(refresh)
+}
+
+// Cleanup stops shared work even when called directly, and waits only a bounded
+// time if a custom client fails to honor cancellation.
+func (u *ConsulUpstreams) Cleanup() error {
+	u.mu.Lock()
+	u.closed = true
+	if u.cancel != nil {
+		u.cancel()
+	}
+	u.mu.Unlock()
+	if u.closeIdle != nil {
+		defer u.closeIdle()
+	}
+	done := make(chan struct{})
+	go func() {
+		u.wg.Wait()
+		close(done)
+	}()
+	timer := time.NewTimer(min(time.Duration(u.Timeout), consulTimeout) + time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errors.New("timed out stopping Consul upstream refreshes")
+	}
 }
 
 func (u *ConsulUpstreams) selectTier(snapshot snapshot, retried bool) (string, []string) {
@@ -264,23 +450,32 @@ func (u *ConsulUpstreams) markRetry(r *http.Request, service string) {
 }
 
 func (u *ConsulUpstreams) ResetCache(r *http.Request) error {
-	if r == nil {
-		u.mu.Lock()
-		u.entries = make(map[string]cacheEntry)
-		u.mu.Unlock()
-		return nil
+	var service string
+	if r != nil {
+		service = u.expandedService(r)
+		if !validServiceName(service) {
+			return nil
+		}
+		u.markRetry(r, service)
 	}
-	service := u.expandedService(r)
-	if !validServiceName(service) {
-		return nil
-	}
-	u.markRetry(r, service)
 	u.mu.Lock()
-	if entry, ok := u.entries[service]; ok {
-		entry.freshness = time.Time{}
-		u.entries[service] = entry
+	defer u.mu.Unlock()
+	if r == nil {
+		for service, entry := range u.entries {
+			if entry.inflight == nil {
+				delete(u.entries, service)
+			} else {
+				// Retain active slots until they finish, then discard their results.
+				entry.hasResult = false
+				entry.discard = true
+			}
+		}
+		return nil
 	}
-	u.mu.Unlock()
+	if entry, ok := u.entries[service]; ok && time.Since(entry.lastSuccess) >= resetMinInterval {
+		entry.freshness = time.Time{}
+		// In-flight work and failure backoff survive request retries.
+	}
 	return nil
 }
 
@@ -382,7 +577,7 @@ func (u *ConsulUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next()
 	for d.NextBlock(0) {
 		switch d.Val() {
-		case "address", "service", "refresh", "grace_period":
+		case "address", "service", "refresh", "grace_period", "timeout":
 			option := d.Val()
 			if !d.NextArg() {
 				return d.ArgErr()
@@ -403,8 +598,10 @@ func (u *ConsulUpstreams) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				}
 				if option == "refresh" {
 					u.Refresh = caddy.Duration(duration)
-				} else {
+				} else if option == "grace_period" {
 					u.GracePeriod = caddy.Duration(duration)
+				} else {
+					u.Timeout = caddy.Duration(duration)
 				}
 			}
 		case "locality":
@@ -462,6 +659,7 @@ var (
 	_ caddy.Module                       = (*ConsulUpstreams)(nil)
 	_ caddy.Provisioner                  = (*ConsulUpstreams)(nil)
 	_ caddy.Validator                    = (*ConsulUpstreams)(nil)
+	_ caddy.CleanerUpper                 = (*ConsulUpstreams)(nil)
 	_ caddyfile.Unmarshaler              = (*ConsulUpstreams)(nil)
 	_ reverseproxy.UpstreamSource        = (*ConsulUpstreams)(nil)
 	_ reverseproxy.CachingUpstreamSource = (*ConsulUpstreams)(nil)

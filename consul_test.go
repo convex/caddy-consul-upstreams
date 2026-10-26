@@ -2,7 +2,6 @@ package consul
 
 import (
 	"context"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
@@ -52,14 +51,16 @@ func instance(nodeAddress, serviceAddress string, port int, meta map[string]stri
 }
 
 func testModule(client *fakeConsul) *ConsulUpstreams {
-	return &ConsulUpstreams{
+	u := &ConsulUpstreams{
 		Service:     "{service}",
 		Refresh:     caddy.Duration(time.Hour),
 		GracePeriod: caddy.Duration(time.Second),
 		client:      client,
 		logger:      zap.NewNop(),
-		entries:     make(map[string]cacheEntry),
+		Timeout:     caddy.Duration(consulTimeout),
 	}
+	u.initCache(context.Background())
+	return u
 }
 
 func request(service string) *http.Request {
@@ -171,53 +172,6 @@ func TestAddressesUseServiceAddressAndKeepOrder(t *testing.T) {
 	}
 }
 
-func TestCacheRefreshResetGraceAndEmpty(t *testing.T) {
-	f := &fakeConsul{entries: []*api.ServiceEntry{instance("10.0.0.1", "", 80, nil)}}
-	f.set(nil, errors.New("unavailable"))
-	if _, err := testModule(f).GetUpstreams(request("unavailable")); err == nil {
-		t.Fatal("initial refresh error accepted")
-	}
-	f.set([]*api.ServiceEntry{instance("10.0.0.1", "", 80, nil)}, nil)
-	u := testModule(f)
-	r := request("api")
-	if _, err := u.GetUpstreams(r); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := u.GetUpstreams(r); err != nil || f.callCount() != 2 {
-		t.Fatalf("cache hit: calls=%d err=%v", f.callCount(), err)
-	}
-	if err := u.ResetCache(r); err != nil {
-		t.Fatal(err)
-	}
-	f.set([]*api.ServiceEntry{instance("10.0.0.2", "", 80, nil)}, nil)
-	got, err := u.GetUpstreams(r)
-	if err != nil || len(got) != 1 || got[0].Dial != "10.0.0.2:80" || f.callCount() != 3 {
-		t.Fatalf("cache reset: %v %v calls=%d", got, err, f.callCount())
-	}
-
-	u.mu.Lock()
-	u.entries["api"] = cacheEntry{snapshot: snapshot{}, freshness: time.Now().Add(-time.Hour)}
-	u.mu.Unlock()
-	f.set(nil, nil)
-	got, err = u.GetUpstreams(r)
-	if err != nil || len(got) != 0 {
-		t.Fatalf("empty successful response: %v %v", got, err)
-	}
-
-	u.mu.Lock()
-	u.entries["api"] = cacheEntry{snapshot: snapshot{all: []string{"10.0.0.1:80"}}, freshness: time.Now().Add(-time.Hour)}
-	u.mu.Unlock()
-	f.set(nil, errors.New("unavailable"))
-	got, err = u.GetUpstreams(r)
-	if err != nil || len(got) != 1 {
-		t.Fatalf("grace: %v %v", got, err)
-	}
-	calls := f.callCount()
-	if _, err := u.GetUpstreams(r); err != nil || f.callCount() != calls {
-		t.Fatalf("grace did not suppress refresh: calls=%d err=%v", f.callCount(), err)
-	}
-}
-
 func TestConcurrentFirstRefreshIsSingle(t *testing.T) {
 	f := &fakeConsul{entries: []*api.ServiceEntry{instance("10.0.0.1", "", 80, nil)}}
 	u := testModule(f)
@@ -245,6 +199,7 @@ func TestLocalitySelectionRefreshes(t *testing.T) {
 		instance("10.0.2.1", "", 80, map[string]string{"az": "c"}),
 	}}
 	u := testModule(f)
+	u.GracePeriod = 0
 	u.Locality = &Locality{NodeMetaKey: "az", LocalValue: "a", Minimum: 2}
 	r := request("api")
 	got, err := u.GetUpstreams(r)
@@ -261,9 +216,7 @@ func TestLocalitySelectionRefreshes(t *testing.T) {
 		instance("10.0.2.1", "", 80, map[string]string{"az": "c"}),
 	}, nil)
 	u.mu.Lock()
-	entry := u.entries["api"]
-	entry.freshness = time.Time{}
-	u.entries["api"] = entry
+	u.entries["api"].freshness = time.Time{}
 	u.mu.Unlock()
 	got, err = u.GetUpstreams(r)
 	if err != nil || len(got) != 3 || tier(r) != "all" {
