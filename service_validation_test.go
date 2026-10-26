@@ -7,6 +7,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hashicorp/consul/api"
 )
 
 func TestServiceNameValidation(t *testing.T) {
@@ -92,5 +94,45 @@ func TestStaticServiceWhitespaceIsTrimmed(t *testing.T) {
 	}
 	if got := u.expandedService(r); got != "api" {
 		t.Fatalf("request without a replacer expansion = %q", got)
+	}
+}
+
+func TestInvalidResetPreservesCachedServices(t *testing.T) {
+	for _, name := range []string{"../../agent/self", "", "..", strings.Repeat("a", 129)} {
+		t.Run(name, func(t *testing.T) {
+			f := &fakeConsul{entries: []*api.ServiceEntry{instance("10.0.0.1", "", 8080, nil)}}
+			u := testModule(f)
+			u.GracePeriod = 0
+			if _, err := u.GetUpstreams(request("api")); err != nil {
+				t.Fatal(err)
+			}
+			f.set([]*api.ServiceEntry{instance("10.0.0.2", "", 8080, nil)}, nil)
+			if err := u.ResetCache(request(name)); err != nil {
+				t.Fatal(err)
+			}
+			got, err := u.GetUpstreams(request("api"))
+			if err != nil || len(got) != 1 || got[0].Dial != "10.0.0.1:8080" || f.callCount() != 1 {
+				t.Fatalf("invalid reset changed a cached service: upstreams=%v error=%v calls=%d", got, err, f.callCount())
+			}
+		})
+	}
+}
+
+func TestUnsafeServiceTemplatesNeverReachConsul(t *testing.T) {
+	for _, template := range []string{"api{", "../../agent/self{unknown}", "{service}/admin"} {
+		t.Run(template, func(t *testing.T) {
+			f := &fakeConsul{}
+			u := testModule(f)
+			u.Service = template
+			if err := u.Validate(); err != nil {
+				t.Fatalf("dynamic templates are validated after expansion: %v", err)
+			}
+			if _, err := u.GetUpstreams(request("api")); err == nil || !strings.Contains(err.Error(), "invalid Consul service name") {
+				t.Fatalf("expected service validation error, got %v", err)
+			}
+			if f.callCount() != 0 || len(u.entries) != 0 {
+				t.Fatal("unsafe template reached Consul or the cache")
+			}
+		})
 	}
 }
