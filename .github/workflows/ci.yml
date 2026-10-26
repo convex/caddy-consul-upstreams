@@ -14,8 +14,9 @@ concurrency:
 
 env:
   GO_VERSION: "1.26"
-  CADDY_VERSION: v2.11.4
+  CADDY_VERSION: v2.11.7
   XCADDY_VERSION: v0.4.7
+  GOVULNCHECK_VERSION: v1.9.0
 
 jobs:
   lint:
@@ -51,6 +52,10 @@ jobs:
         run: go mod tidy -diff
       - name: go vet
         run: go vet ./...
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+      - name: Scan source dependencies
+        run: govulncheck ./...
 
   test:
     runs-on: ubuntu-24.04
@@ -97,6 +102,14 @@ jobs:
         run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@${{ env.XCADDY_VERSION }}
       - name: Build Caddy with this module
         run: xcaddy build ${{ env.CADDY_VERSION }} --with github.com/convex/caddy-consul-upstreams=.
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@${{ env.GOVULNCHECK_VERSION }}
+      # Scan the complete Caddy binary as well. Keep this informational: its
+      # optional modules have a large dependency tree, and standard-library
+      # findings also depend on the Go patch release used for the build.
+      - name: Scan Caddy binary
+        continue-on-error: true
+        run: govulncheck -mode binary ./caddy
       - name: Module is registered
         run: ./caddy list-modules | grep -Fx http.reverse_proxy.upstreams.consul
       - name: Caddyfile adapts
