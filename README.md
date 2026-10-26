@@ -82,7 +82,8 @@ expands `{$...}` environment placeholders while adapting the Caddyfile. For
 example, a Caddy instance with `local_value a` and passing service instances in
 `a`, `a`, `b`, and `c` uses only the two `a` instances when `minimum` is 2. If
 fewer than two `a` instances are passing, it uses all passing instances.
-Missing target metadata is nonlocal. Retries re-query Consul and apply the same
+Missing target metadata is nonlocal. An address registered more than once is
+local if any of its registrations is local. Retries re-query Consul and apply the same
 rule.
 
 The request placeholder `{http.reverse_proxy.upstreams.consul.tier}` is either
