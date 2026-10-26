@@ -9,12 +9,15 @@ does not generate routes or configure Consul.
 Build Caddy with [xcaddy](https://github.com/caddyserver/xcaddy):
 
 ```sh
-xcaddy build v2.11.4 --with github.com/get-convex/caddy-consul-upstreams@v0.1.1
+xcaddy build v2.11.4 --with github.com/convex/caddy-consul-upstreams@v0.2.0
 ```
 
-For local development, replace `@v0.1.1` with `=.`.
+For local development, replace `@v0.2.0` with `=.`.
 
-v0.1.1 is compatible with Caddy 2.11.4.
+v0.2.0 is compatible with Caddy 2.11.4.
+
+Releases before v0.2.0 were published under the old module path
+`github.com/get-convex/caddy-consul-upstreams`.
 
 ## Caddyfile
 
@@ -78,5 +81,5 @@ The request placeholder `{http.reverse_proxy.upstreams.consul.tier}` is either
 
 ## Scope
 
-v0.1.1 intentionally has no tag locality, latency ordering, weights, WAN
+v0.2.0 intentionally has no tag locality, latency ordering, weights, WAN
 federation, arbitrary preference expressions, or custom metrics.
