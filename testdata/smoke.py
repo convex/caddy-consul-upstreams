@@ -21,6 +21,7 @@ class Fixtures:
         self.lock = threading.Lock()
         self.entries = []
         self.consul_calls = 0
+        self.consul_paths = []
         self.backend_calls = 0
 
     def counts(self):
@@ -31,11 +32,18 @@ class Fixtures:
         with self.lock:
             self.entries = entries
 
+    def request_paths(self):
+        with self.lock:
+            return list(self.consul_paths)
+
 
 def consul_handler(fixtures):
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             url = urlsplit(self.path)
+            with fixtures.lock:
+                fixtures.consul_calls += 1
+                fixtures.consul_paths.append(url.path)
             if url.path not in ("/v1/health/service/api", "/v1/health/service/web"):
                 self.send_error(404)
                 return
@@ -43,7 +51,6 @@ def consul_handler(fixtures):
                 self.send_error(400, "discovery must request passing instances")
                 return
             with fixtures.lock:
-                fixtures.consul_calls += 1
                 body = json.dumps(fixtures.entries).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -196,6 +203,10 @@ def run(args):
                 elif scenario == "map":
                     for host in ("api.example.test", "web.example.test"):
                         expect_backend(get(port, host), "all")
+                    paths = fixtures.request_paths()[before_consul:]
+                    assert paths == ["/v1/health/service/api", "/v1/health/service/web"], (
+                        f"allowed hosts queried the wrong services: {paths}"
+                    )
                     before_unknown = fixtures.counts()[0]
                     status, _, _ = get(port, "unknown.example.test")
                     assert status == 503, f"unknown host should fail closed, got {status}"
