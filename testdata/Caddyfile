@@ -1,15 +1,24 @@
-:8080 {
+{
+	admin off
+	auto_https off
+}
+
+http://:{$SMOKE_PORT:8080} {
+	bind 127.0.0.1
+	header >X-Consul-Tier {http.reverse_proxy.upstreams.consul.tier}
 	reverse_proxy {
 		dynamic consul {
-			address http://127.0.0.1:8500
-			service {service_name}
+			address {$CONSUL_ADDRESS:http://127.0.0.1:8500}
+			service api
 			refresh 10s
 			grace_period 30s
 			locality {
-				node_meta availability-zone-id
-				local_value az-a
+				node_meta az
+				local_value a
 				minimum 2
 			}
 		}
+		lb_retries 3
+		fail_duration 30s
 	}
 }
