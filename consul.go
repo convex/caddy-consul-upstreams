@@ -114,6 +114,9 @@ func (u *ConsulUpstreams) Validate() error {
 	if strings.TrimSpace(u.Service) == "" {
 		return errors.New("service is required")
 	}
+	if !strings.Contains(u.Service, "{") && !validServiceName(strings.TrimSpace(u.Service)) {
+		return fmt.Errorf("invalid Consul service name %q", u.Service)
+	}
 	if u.Refresh < 0 || u.GracePeriod < 0 {
 		return errors.New("refresh and grace_period must not be negative")
 	}
@@ -136,8 +139,8 @@ func (u *ConsulUpstreams) Validate() error {
 
 func (u *ConsulUpstreams) GetUpstreams(r *http.Request) ([]*reverseproxy.Upstream, error) {
 	service := u.expandedService(r)
-	if service == "" {
-		return nil, errors.New("expanded Consul service is empty")
+	if !validServiceName(service) {
+		return nil, fmt.Errorf("invalid Consul service name %q", service)
 	}
 
 	u.mu.RLock()
@@ -216,6 +219,9 @@ func (u *ConsulUpstreams) ResetCache(r *http.Request) error {
 		return nil
 	}
 	service := u.expandedService(r)
+	if !validServiceName(service) {
+		return nil
+	}
 	u.mu.Lock()
 	if entry, ok := u.entries[service]; ok {
 		entry.freshness = time.Time{}
@@ -254,13 +260,29 @@ func (u *ConsulUpstreams) makeSnapshot(entries []*api.ServiceEntry) snapshot {
 
 func (u *ConsulUpstreams) expandedService(r *http.Request) string {
 	if r == nil {
-		return u.Service
+		return strings.TrimSpace(u.Service)
 	}
 	repl, ok := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
 	if !ok {
-		return u.Service
+		return strings.TrimSpace(u.Service)
 	}
 	return strings.TrimSpace(repl.ReplaceAll(u.Service, ""))
+}
+
+func validServiceName(name string) bool {
+	// Consul's HTTP API does not impose this limit; bound request-derived names
+	// conservatively to keep cache keys and requests small.
+	if len(name) == 0 || len(name) > 128 || name == "." || name == ".." {
+		return false
+	}
+	for i := range len(name) {
+		c := name[i]
+		if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' || c == '.' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func upstreams(dials []string) []*reverseproxy.Upstream {
