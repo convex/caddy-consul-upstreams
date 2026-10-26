@@ -30,7 +30,7 @@ func TestDuplicateAddressLocalityIsOrderIndependent(t *testing.T) {
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("snapshot: got %#v, want %#v", got, want)
 			}
-			if tier, _ := u.selectTier(got); tier != "local" {
+			if tier, _ := u.selectTier(got, false); tier != "local" {
 				t.Fatalf("tier: got %q, want local", tier)
 			}
 			if logs.FilterMessage("Consul registrations have conflicting locality metadata").Len() != 1 {

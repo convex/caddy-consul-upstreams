@@ -35,6 +35,8 @@ example.com {
 				minimum 2
 			}
 		}
+		lb_retries 2
+		fail_duration 30s
 	}
 }
 ```
@@ -83,11 +85,17 @@ example, a Caddy instance with `local_value a` and passing service instances in
 `a`, `a`, `b`, and `c` uses only the two `a` instances when `minimum` is 2. If
 fewer than two `a` instances are passing, it uses all passing instances.
 Missing target metadata is nonlocal. An address registered more than once is
-local if any of its registrations is local. Retries re-query Consul and apply the same
-rule.
+local if any of its registrations is local. By default, a retry after selecting the
+local tier uses all passing instances. Set `strict` inside `locality` (JSON:
+`"strict": true`) to preserve local selection on retries. Retries require
+`lb_retries` or `lb_try_duration`; Caddy disables retries by default. The example
+uses retries and passive health checks so a failed local instance can give way
+to a remote instance. Caddy retries dial failures for any method; after a
+connection succeeds, its default retry matcher permits only GET requests. Use
+`lb_retry_match` deliberately for other methods.
 
-The request placeholder `{http.reverse_proxy.upstreams.consul.tier}` is either
-`local` or `all`.
+The request placeholder `{http.reverse_proxy.upstreams.consul.tier}` is one of
+`local`, `all`, or `fallback` (a retry widened from the local tier).
 
 ## Scope
 
