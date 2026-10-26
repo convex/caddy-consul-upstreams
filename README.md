@@ -43,6 +43,11 @@ example.com {
 `address http://127.0.0.1:8500`, `refresh 1m`, `grace_period 0s`, and locality
 `minimum 2`.
 
+Service names contain at most 128 ASCII letters, digits, `.`, `_`, or `-`,
+and cannot be `.` or `..`. Invalid expanded names are rejected before any
+Consul request. This validates syntax only; it does not authorize which
+services a request-controlled placeholder can select.
+
 ## JSON
 
 ```json
