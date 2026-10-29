@@ -15,7 +15,7 @@ xcaddy build v2.11.7 --with github.com/convex/caddy-consul-upstreams@v0.2.0
 For local development, replace `@v0.2.0` with `=.`.
 
 v0.2.0 is compatible with Caddy 2.11.7 and requires Go 1.26.9 or newer. Releases
-before v0.2.0 were published under `github.com/get-convex/caddy-consul-upstreams`.
+before v0.2.0 were published under `github.com/convex/caddy-consul-upstreams`.
 
 ## Caddyfile
 
